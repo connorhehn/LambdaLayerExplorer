@@ -2,7 +2,7 @@
 
 AWS publishes official Lambda layers — Lambda Powertools, SDK for pandas, OpenTelemetry, and others — but provides no easy way to see what Python packages are actually bundled inside them. This project solves that with a fully serverless pipeline that downloads, inspects, and catalogues every layer weekly, then surfaces the results in a searchable React UI.
 
-**[Live site →](https://d1turspi33srjo.cloudfront.net)**
+**[Live site →](https://lambda-layer-explorer.com)**
 
 ---
 

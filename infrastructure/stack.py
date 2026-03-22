@@ -3,23 +3,42 @@ from aws_cdk import (
     Duration,
     RemovalPolicy,
     CfnOutput,
+    aws_certificatemanager as acm,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
     aws_events as events,
     aws_events_targets as targets,
     aws_iam as iam,
     aws_lambda as lambda_,
+    aws_route53 as route53,
+    aws_route53_targets as route53_targets,
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
 )
 from constructs import Construct
+
+DOMAIN = "lambda-layer-explorer.com"
 
 
 class LambdaLayersStack(cdk.Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # ── S3 bucket (private) ──────────────────────────────────────────────
+        # ── Route 53 hosted zone (created automatically when registering via R53)
+        hosted_zone = route53.HostedZone.from_lookup(
+            self, "HostedZone", domain_name=DOMAIN
+        )
+
+        # ── ACM certificate (must be in us-east-1 for CloudFront) ────────────
+        certificate = acm.Certificate(
+            self,
+            "Certificate",
+            domain_name=DOMAIN,
+            subject_alternative_names=[f"www.{DOMAIN}"],
+            validation=acm.CertificateValidation.from_dns(hosted_zone),
+        )
+
+        # ── S3 bucket (private) ───────────────────────────────────────────────
         bucket = s3.Bucket(
             self,
             "LayersBucket",
@@ -62,6 +81,8 @@ class LambdaLayersStack(cdk.Stack):
                     cache_policy=data_cache_policy,
                 )
             },
+            domain_names=[DOMAIN, f"www.{DOMAIN}"],
+            certificate=certificate,
             default_root_object="index.html",
             error_responses=[
                 cloudfront.ErrorResponse(
@@ -77,6 +98,17 @@ class LambdaLayersStack(cdk.Stack):
                     ttl=Duration.seconds(0),
                 ),
             ],
+        )
+
+        # ── Route 53: A records → CloudFront ──────────────────────────────────
+        cf_target = route53.RecordTarget.from_alias(
+            route53_targets.CloudFrontTarget(distribution)
+        )
+        route53.ARecord(
+            self, "ARecord", zone=hosted_zone, target=cf_target
+        )
+        route53.ARecord(
+            self, "WwwARecord", zone=hosted_zone, record_name="www", target=cf_target
         )
 
         # ── Lambda: Discovery ─────────────────────────────────────────────────
@@ -95,7 +127,7 @@ class LambdaLayersStack(cdk.Stack):
                 actions=[
                     "lambda:ListLayers",
                     "lambda:ListLayerVersions",
-                    "lambda:GetLayerVersion",  # needed to probe cross-account public layers
+                    "lambda:GetLayerVersion",
                 ],
                 resources=["*"],
             )
@@ -165,8 +197,6 @@ class LambdaLayersStack(cdk.Stack):
         weekly_rule.add_target(targets.LambdaFunction(orchestrator_fn))
 
         # ── Deploy React frontend ─────────────────────────────────────────────
-        # app.py builds the frontend (npm run build) before synthesis so that
-        # we can simply upload the pre-built dist/ folder here — no Docker needed.
         s3deploy.BucketDeployment(
             self,
             "DeployFrontend",
@@ -178,17 +208,8 @@ class LambdaLayersStack(cdk.Stack):
         )
 
         # ── Outputs ───────────────────────────────────────────────────────────
-        CfnOutput(
-            self,
-            "SiteURL",
-            value=f"https://{distribution.distribution_domain_name}",
-            description="CloudFront URL for the Lambda Layers Explorer",
-        )
-        CfnOutput(
-            self,
-            "BucketName",
-            value=bucket.bucket_name,
-        )
+        CfnOutput(self, "SiteURL", value=f"https://{DOMAIN}")
+        CfnOutput(self, "BucketName", value=bucket.bucket_name)
         CfnOutput(
             self,
             "OrchestratorFunctionName",
