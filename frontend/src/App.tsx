@@ -10,6 +10,7 @@ import { LayersData, Layer } from "./types";
 import Header from "./components/Header";
 import SearchBar from "./components/SearchBar";
 import LayerCard from "./components/LayerCard";
+import Footer from "./components/Footer";
 
 function matchesSearch(layer: Layer, query: string): boolean {
   if (!query) return true;
@@ -110,6 +111,7 @@ export default function App() {
           </Grid>
         )}
       </Container>
+      <Footer />
     </Box>
   );
 }
