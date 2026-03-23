@@ -59,6 +59,10 @@ KNOWN_LAYERS: list[tuple[str, str, str, int]] = [
     # ── CodeGuru Profiler — Python ────────────────────────────────────────────
     ("157417159150", "AWSCodeGuruProfilerPythonAgentLambdaLayer", "AWS CodeGuru Profiler", 11),
 
+    # ── Node.js ───────────────────────────────────────────────────────────────
+    ("094274105915", "AWSLambdaPowertoolsTypeScriptV2",  "AWS Lambda Powertools for TypeScript", 30),
+    ("615299751070", "AWSOpenTelemetryDistroJs",         "AWS Distro for OpenTelemetry",         12),
+
     # ── SciPy (legacy) ────────────────────────────────────────────────────────
     ("668099181075", "AWSLambda-Python27-SciPy1x", "AWS Lambda (SciPy)", 117),
     ("668099181075", "AWSLambda-Python36-SciPy1x", "AWS Lambda (SciPy)", 115),

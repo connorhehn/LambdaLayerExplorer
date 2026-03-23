@@ -1,12 +1,17 @@
 """
 Inspector Lambda
 
-Given a layer descriptor (output from discovery), downloads the layer zip,
-unpacks it in /tmp, and catalogues all Python packages found in dist-info
-or egg-info metadata files.
+Given a layer descriptor (output from discovery), downloads the layer zip
+and catalogues all packages found inside it.
+
+Supported formats:
+  Python — .dist-info/METADATA  (PEP 566, modern pip)
+           .egg-info/PKG-INFO   (older setuptools)
+  Node.js — node_modules/<pkg>/package.json  (top-level only, no nested deps)
 """
 
 import email.parser
+import json
 import logging
 import os
 import urllib.request
@@ -21,20 +26,9 @@ TMP_ZIP = "/tmp/layer.zip"
 
 
 def handler(event, context):
-    """
-    event: a single layer dict as returned by the discovery Lambda, e.g.:
-    {
-        "name": "AWSLambdaPowertoolsPythonV3-python312",
-        "arn": "arn:aws:lambda:us-east-1:017000801446:layer:...",
-        "latest_version": 7,
-        "latest_version_arn": "arn:aws:lambda:us-east-1:...:7",
-        ...
-    }
-    """
     layer_version_arn: str = event["latest_version_arn"]
     logger.info("Inspecting layer: %s", layer_version_arn)
 
-    # Derive LayerName (ARN without trailing :version) and VersionNumber
     parts = layer_version_arn.split(":")
     version_number = int(parts[-1])
     layer_name_arn = ":".join(parts[:-1])
@@ -47,12 +41,8 @@ def handler(event, context):
 
     download_url: str = response["Content"]["Location"]
     content_size: int = response["Content"].get("CodeSize", 0)
-    logger.info(
-        "Downloading layer zip (%.1f MB) from presigned URL",
-        content_size / 1024 / 1024,
-    )
+    logger.info("Downloading %.1f MB", content_size / 1024 / 1024)
 
-    # Download to /tmp to avoid exhausting Lambda memory for large layers
     if os.path.exists(TMP_ZIP):
         os.remove(TMP_ZIP)
     urllib.request.urlretrieve(download_url, TMP_ZIP)
@@ -60,7 +50,7 @@ def handler(event, context):
     packages = _extract_packages(TMP_ZIP)
     os.remove(TMP_ZIP)
 
-    logger.info("Found %d packages in layer %s", len(packages), event["name"])
+    logger.info("Found %d packages in %s", len(packages), event["name"])
 
     return {
         **event,
@@ -71,67 +61,128 @@ def handler(event, context):
 
 
 def _extract_packages(zip_path: str) -> list[dict]:
-    """Return a list of package dicts found inside the layer zip."""
-    packages = []
-    seen_names: set[str] = set()
-
     with zipfile.ZipFile(zip_path, "r") as zf:
         names = zf.namelist()
 
-        # Prefer .dist-info/METADATA (PEP 566, modern pip)
-        metadata_files = [
-            n for n in names if ".dist-info/METADATA" in n
-        ]
+        # ── Python ───────────────────────────────────────────────────────────
+        meta_files = [n for n in names if ".dist-info/METADATA" in n]
+        if not meta_files:
+            meta_files = [n for n in names if ".egg-info/PKG-INFO" in n]
 
-        # Fall back to .egg-info/PKG-INFO (older setuptools)
-        if not metadata_files:
-            metadata_files = [
-                n for n in names if ".egg-info/PKG-INFO" in n
-            ]
+        if meta_files:
+            return _parse_python_packages(zf, meta_files)
 
-        for meta_path in metadata_files:
-            try:
-                with zf.open(meta_path) as f:
-                    content = f.read().decode("utf-8", errors="replace")
-                pkg = _parse_metadata(content)
-                if pkg and pkg["name"] not in seen_names:
-                    seen_names.add(pkg["name"])
-                    packages.append(pkg)
-            except Exception as exc:
-                logger.warning("Failed to parse %s: %s", meta_path, exc)
+        # ── Node.js ───────────────────────────────────────────────────────────
+        pkg_json_files = [n for n in names if _is_top_level_package_json(n)]
+        if pkg_json_files:
+            return _parse_node_packages(zf, pkg_json_files)
 
+    return []
+
+
+# ── Python ────────────────────────────────────────────────────────────────────
+
+def _parse_python_packages(zf: zipfile.ZipFile, paths: list[str]) -> list[dict]:
+    packages, seen = [], set()
+    for path in paths:
+        try:
+            with zf.open(path) as f:
+                content = f.read().decode("utf-8", errors="replace")
+            pkg = _parse_python_metadata(content)
+            if pkg and pkg["name"] not in seen:
+                seen.add(pkg["name"])
+                packages.append(pkg)
+        except Exception as exc:
+            logger.warning("Failed to parse %s: %s", path, exc)
     return packages
 
 
-def _parse_metadata(content: str) -> dict | None:
-    """Parse an RFC 2822-style Python package METADATA / PKG-INFO file."""
-    parser = email.parser.Parser()
-    msg = parser.parsestr(content)
-
+def _parse_python_metadata(content: str) -> dict | None:
+    msg = email.parser.Parser().parsestr(content)
     name = msg.get("Name")
     version = msg.get("Version")
     if not name or not version:
         return None
-
-    home_page = msg.get("Home-page") or _extract_homepage(msg)
-
     return {
         "name": name,
         "version": version,
         "summary": msg.get("Summary", ""),
-        "home_page": home_page or "",
+        "home_page": msg.get("Home-page") or _python_homepage(msg) or "",
         "license": msg.get("License", ""),
-        "requires_python": msg.get("Requires-Python", ""),
     }
 
 
-def _extract_homepage(msg) -> str:
-    """Extract homepage from Project-URL entries (PEP 753)."""
-    preferred_labels = {"Homepage", "Source", "Repository"}
+def _python_homepage(msg) -> str:
     for entry in msg.get_all("Project-URL") or []:
         if "," not in entry:
             continue
         label, url = entry.split(",", 1)
-        if label.strip() in preferred_labels:
+        if label.strip() in {"Homepage", "Source", "Repository"}:
             return url.strip()
     return ""
+
+
+# ── Node.js ───────────────────────────────────────────────────────────────────
+
+def _is_top_level_package_json(path: str) -> bool:
+    """
+    Match only direct children of a node_modules directory, not nested deps.
+
+    Valid:
+      nodejs/node_modules/express/package.json          (regular)
+      nodejs/node_modules/@aws-sdk/client-s3/package.json  (scoped)
+    Invalid:
+      nodejs/node_modules/express/node_modules/mime/package.json  (nested)
+      nodejs/node_modules/express/lib/package.json               (sub-path)
+    """
+    parts = path.split("/")
+    if parts[-1] != "package.json":
+        return False
+    try:
+        nm_idx = parts.index("node_modules")
+    except ValueError:
+        return False
+    # Reject nested node_modules
+    if "node_modules" in parts[nm_idx + 1:]:
+        return False
+    after = parts[nm_idx + 1:]  # segments after node_modules
+    # Regular:  [name, package.json]
+    if len(after) == 2:
+        return True
+    # Scoped:   [@scope, name, package.json]
+    if len(after) == 3 and after[0].startswith("@"):
+        return True
+    return False
+
+
+def _parse_node_packages(zf: zipfile.ZipFile, paths: list[str]) -> list[dict]:
+    packages, seen = [], set()
+    for path in paths:
+        try:
+            with zf.open(path) as f:
+                data = json.loads(f.read().decode("utf-8", errors="replace"))
+            pkg = _parse_package_json(data)
+            if pkg and pkg["name"] not in seen:
+                seen.add(pkg["name"])
+                packages.append(pkg)
+        except Exception as exc:
+            logger.warning("Failed to parse %s: %s", path, exc)
+    return packages
+
+
+def _parse_package_json(data: dict) -> dict | None:
+    name = data.get("name")
+    version = data.get("version")
+    if not name or not version:
+        return None
+
+    license_raw = data.get("license", "")
+    license_str = license_raw.get("type", "") if isinstance(license_raw, dict) else license_raw
+
+    return {
+        "name": name,
+        "version": version,
+        "summary": data.get("description", ""),
+        "home_page": data.get("homepage", ""),
+        "license": license_str,
+    }
